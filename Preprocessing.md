@@ -1,0 +1,460 @@
+Timilsina et al preprocessing
+================
+Nourhan Abdelfattah
+2024-11-8
+
+``` r
+library(easypackages)
+MyPackages<-c("dplyr","ggplot2","ggpubr","gridExtra","viridis","egg","presto","ComplexHeatmap",
+              "Seurat","harmony","cowplot","patchwork","stringr", "ggmin","SingleCellExperiment","CellChat")
+libraries(MyPackages)
+
+ObjName= "E0771 "
+Subset="All_Clusters"
+resolution= 1
+```
+
+\#We first generate the SeuratObjects for each sample and we run Doublet
+finder
+
+``` r
+Files= c("Ctrl_1_Count","KO_1_Count","KO_3_Count"  )
+
+for(i in 1:length(Files)){
+print(Files[i])
+MYSC=Read10X(data.dir = paste0(RobjDirectory,"Archive/",Files[i],"/filtered_feature_bc_matrix/"))
+SeuratObjMYSC <- CreateSeuratObject(counts = MYSC, min.features = 100,project = Files[i])
+SeuratObjMYSC <- NormalizeData(SeuratObjMYSC, normalization.method = "LogNormalize", 
+                               scale.factor =10000)%>%
+  FindVariableFeatures(selection.method = "vst", nfeatures =2000)%>%
+  ScaleData()%>%
+  RunPCA(features = VariableFeatures(object = SeuratObjMYSC))
+
+library(DoubletFinder)
+## pK Identification (no ground-truth)
+sweep.res.list <- paramSweep_v3(SeuratObjMYSC, PCs = 1:10, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+df=as.data.frame(bcmvn)
+## Homotypic Doublet Proportion Estimate
+homotypic.prop <- modelHomotypic(SeuratObjMYSC@meta.data$Clusters) 
+SeuratObjMYSC@meta.data$ClusteringResults
+nExp_poi <- round(0.075*nrow(SeuratObjMYSC@meta.data))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+## Run DoubletFinder with varying classification stringencies
+SeuratObjMYSC <- doubletFinder_v3(SeuratObjMYSC, PCs = 1:10, pN = 0.25, pK =
+                                    as.numeric(df$pK[df$BCmetric==max(df$BCmetric)]), 
+nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+
+SeuratObjMYSC <- doubletFinder_v3(SeuratObjMYSC, PCs = 1:10, pN = 0.25, pK =
+                                    as.numeric(df$pK[df$BCmetric==max(df$BCmetric)]),
+nExp = nExp_poi.adj, reuse.pANN = colnames(SeuratObjMYSC@meta.data)[5], sct = FALSE)
+colnames(SeuratObjMYSC@meta.data)[4]="pANN"
+colnames(SeuratObjMYSC@meta.data)[5]="DoubletStatus"
+assign(Files[i],SeuratObjMYSC)
+  
+}
+```
+
+Merging and Annotating the Samples
+
+``` r
+c("Ctrl_1_Count","KO_1_Count","KO_3_Count"  )
+SeuratObj <- merge(x =Ctrl_1_Count, y = c(KO_1_Count,KO_3_Count), add.cell.ids = c("Ctrl_1_Count","KO_1_Count","KO_3_Count" ))
+
+SeuratObj$Sample <- NA
+SeuratObj$Sample[which(str_detect(SeuratObj$orig.ident, "Ctrl_1_Count"))] <- "Ctrl"
+SeuratObj$Sample[which(str_detect(SeuratObj$orig.ident, "KO_1_Count"))] <- "KO_1"
+SeuratObj$Sample[which(str_detect(SeuratObj$orig.ident, "KO_3_Count"))] <- "KO_3"
+SeuratObj$CellLine="E0771"
+SeuratObj$Mousegenptype="B6"
+
+SeuratObj$SampleType <- NA
+SeuratObj$SampleType[which(str_detect(SeuratObj$orig.ident, "Ctrl_1_Count"))] <- "Control"
+SeuratObj$SampleType[which(str_detect(SeuratObj$orig.ident, "KO_1_Count"))] <- "Foxm1_KO_1"
+SeuratObj$SampleType[which(str_detect(SeuratObj$orig.ident, "KO_3_Count"))] <- "Foxm1_KO_3"
+```
+
+Filtering low quality cells
+
+``` r
+#Calculate mitoRatio and RiboRatio
+SeuratObj$log10GenesPerUMI <- log10(SeuratObj$nFeature_RNA) / log10(SeuratObj$nCount_RNA)
+SeuratObj$percent.mt <- PercentageFeatureSet(SeuratObj, pattern = "^mt-")
+SeuratObj$mitoRatio <- SeuratObj@percent.mt / 100
+SeuratObj$percent.Rp <- PercentageFeatureSet(SeuratObj, pattern = "^Rp[ls]")
+SeuratObj$riboRatio <- SeuratObj@percent.Rp / 100
+
+SeuratObj=subset(SeuratObj,subset = DoubletStatus == "Singlet"&
+                   nFeature_RNA > 200&
+                   percent.mt <15))
+```
+
+Dimension reduction and clustering
+
+``` r
+SeuratObj <- NormalizeData(SeuratObj, normalization.method = "LogNormalize", scale.factor = 10000)%>%
+  FindVariableFeatures( selection.method = "vst", nfeatures = 2000)
+s.genes=read.csv("../mouse sgenes.csv")
+g2m.genes=read.csv("../mouse g2mgenes.csv")
+SeuratObj <- CellCycleScoring(SeuratObj, s.features = s.genes$x, g2m.features = g2m.genes$x, set.ident = TRUE)%>%
+  ScaleData(vars.to.regress = c("S.Score", "G2M.Score"), features = VariableFeatures(SeuratObj))%>%
+  RunPCA(features = VariableFeatures(object = SeuratObj))
+
+SeuratObj <- RunHarmony(SeuratObj, "Sample")
+#ElbowPlot(SeuratObj,ndims = 50,reduction = "harmony")
+
+dimz=1:40
+
+SeuratObj <- FindNeighbors(SeuratObj,reduction = "harmony", dims = dimz)
+SeuratObj <- RunUMAP(SeuratObj, reduction = "harmony",dims= dimz)
+SeuratObj <- FindClusters(SeuratObj, resolution = resolution)
+```
+
+Renaming Clusters
+
+``` r
+SeuratObj$Cluster=NA
+#Rename Clusters
+clusters=levels(as.factor(SeuratObj@meta.data$seurat_clusters))
+for(j in 1:length(clusters)){
+  if(j<10){
+    SeuratObj$Cluster[SeuratObj$seurat_clusters==j-1]=paste0("C0",j)
+  }else{
+    SeuratObj$Cluster[SeuratObj$seurat_clusters==j-1]=paste0("C",j)
+  }
+}
+```
+
+Identifying differentially expressed markers for cell annotation
+
+``` r
+library(presto)
+markers <- wilcoxauc(SeuratObj , 'Cluster',assay = "scale.data")
+
+write.csv(markers,paste0(OutputDirectory,ObjName,Subset," presto Cluster markers ","res",resolution,".csv"))
+
+marker.list=list(Anti_Apoptosis = c("Bcl11b", "Bcl2l1", "Bag3", "Bag4", "Birc3", 
+"Gadd45b"), `B1 B` = c("Ms4a1", "Sspn", "Itgb1", "Epha4", "Col4a4", 
+"Prdm1", "Irf4", "Cd38", "Xbp1", "Pax5", "Bcl11a", "Blk"), Basophil = c("Itga2", 
+"Cd9", "Clec12a"), CAFs = c("Dcn", "Col1a1", "Lum", "Col1a2", 
+"Sfrp2", "Col3a1", "Apod", "Postn", "Cthrc1", "Mmp11", "Col6a3", 
+"Ccn2", "Ctsk", "C1s1", "Col6a2", "Fn1", "Ccdc80", "Sparc", "Rarres2", 
+"Cxcl14", "Col6a1", "Sfrp4", "Aebp1", "Bgn", "Ptgds", "Serpinf1", 
+"Mmp2", "Cfd", "Timp1", "Fbln1", "Vcan", "C1ra", "C3", "Mfap4", 
+"Cxcl12", "Ccn1", "Col5a2", "Mxra8", "Islr", "Igfbp4", "Gsn", 
+"Serping1", "Igf2", "Igf1", "Pcolce", "Meg3", "Spon2", "Thy1", 
+"Cald1", "Igfbp6", "Mfap2", "Aspn", "Lgals1", "Dpt", "Timp3", 
+"Thbs2", "Fstl1", "Nnmt", "Lrp1", "Col5a1", "Htra1", "Col14a1", 
+"Col12a1", "Timp2", "Fbln2", "Srpx", "Pdgfrl", "Olfml3", "Efemp1", 
+"Mmp14", "Laptm4a", "Gem", "Ppic", "Igfbp7", "Egr1", "Fbn1", 
+"Cd63", "Prrx1", "Pmp22", "Htra3", "Tmem176b", "Tnfaip6", "Mdk", 
+"Cdh11", "Comp", "Clec11a", "Col10a1", "Fgf7", "Palld", "Efemp2", 
+"Mfap5", "Fbln5", "Cyp1b1", "Serpinh1", "Lgals3bp", "Col8a1", 
+"Plpp3", "Cfh", "Cilp", "Fap", "Rcn3", "Podn", "Nbl1", "Prss23", 
+"Eln", "Sulf1", "Tmem176a", "Id3", "Lhfp", "Col11a1", "Cst3", 
+"Crispld2", "F2r", "Ifitm3", "Gpnmb", "Adam12", "Tcf4", "Sod3", 
+"Ggt5"), `CD14+ Mono` = c("Fcna", "Cd14", "S100a8", "S100a9"), 
+    `CD16+ Mono` = c("Tcf7l2", "Fcgr3", "Lyn", "Lst1", "Hk3"), 
+    `CD4+ T activated` = c("Cd4", "Il7r", "Trbc2", "Itgb1"), 
+    `CD4+ T Naïve` = c("Cd4", "Il7r", "Trbc2", "Ccr7"), `CD8+ T` = c("Cd8a", 
+    "Cd8b1", "Gzmk", "Gzma", "Ccl5", "Gzmb", "Gzmc", "Gzma"), 
+    cDC1 = c("Clec9a", "Cadm1", "Cpne3", "Dnase1l3", "Wdfy4"), 
+    cDC2 = c("Ccr7", "Fscn1", "Lamp3", "Marcksl1"), cDC3 = c("Clec10a", 
+    "Fcer1a", "Ppa1"), `E0771 markers` = c("Pcm1", "Map1b", "Hspg2", 
+    "Serpine1", "Scd2", "Nrp2", "Nedd4", "Tead1", "Eprs", "Hspa9", 
+    "Myc", "Ubr4", "Prrc2a", "Flnb", "Tcf20"), Endothelial = c("Ackr1", 
+    "Fabp4", "Plvap", "Ramp2", "Vwf", "Aqp1", "Cldn5", "Sparcl1", 
+    "Gng11", "Pecam1", "Eng", "Egfl7", "Hspg2", "Ramp3", "A2m", 
+    "Spry1", "Clec14a", "Rbp7", "Emcn", "Igfbp7", "Adgrl4", "Id1", 
+    "Npdc1", "Esam", "Calcrl", "Cav1", "Igfbp3", "Ifi27", "Rnase1", 
+    "Cd34", "Cavin2", "Ifitm3", "Igfbp4", "Fkbp1a", "Tm4sf1", 
+    "Plpp1", "Hyal2", "Slc9a3r2", "Crip2", "Pdlim1", "Col15a1", 
+    "Col4a1", "Epas1", "Prcp", "Palmd", "Emp1", "Cd36", "Cd93", 
+    "Tcf4", "Socs3", "Cavin1", "Col4a2", "Flt1", "Pdk4", "Cyyr1", 
+    "Id3", "Bcam", "Mctp1", "Lmcd1", "Adamts1", "Sele", "Adamts9", 
+    "Tgfbr2", "Cd59a", "Rcan1", "Edn1", "Tspan7", "Stc1", "Il33", 
+    "Icam2", "Ets2", "Arhgap29", "Gsn", "Cdh5", "Podxl", "Ptprb", 
+    "Mgll", "Sptbn1", "Mmrn2", "Stom", "Adam15", "Jam2", "Sox17", 
+    "Mgst2", "S1pr1", "Thbd", "Vwa1", "Nnmt", "Vim", "Sparc", 
+    "Clu", "App", "Dusp23", "Itga6", "Heg1", "Adcy4", "Nrn1", 
+    "Ldb2", "Fabp5", "Mall", "Nrp1"), Erythroblast = c("Mki67", 
+    "Hba-a1", "Hba-a2"), `Fatty acid metabolism` = c("Acaa1a", 
+    "Acadm", "Acadvl", "Acsl5", "Aldh16a1", "Aldh9a1", "Ech1", 
+    "Echs1", "Hadha", "Hsd17b10", "Slc27a2", "Decr1", "Pex16", 
+    "Scp2"), Fibroblasts = c("Fbln1", "Dcn", "Lum", "C1s1", "C1ra", 
+    "Slit2", "Col1a1", "Col1a2", "Col3a1", "Col6a3", "Aspn", 
+    "Ltbp1", "Itgbl1", "Cald1", "Postn", "Bgn", "Sfrp2"), `G/M prog` = c("Mpo", 
+    "Bcl2", "Kcnq5", "Csf3r"), Glycolysis = c("Slc2a3", "Slc2a8", 
+    "Pfkfb3", "Aldoa", "Eno1", "Gapdh", "Gpi1", "Pgam1", "Pgk1", 
+    "Pkm", "Tpi1", "Gyg", "Mdh1", "Mdh2", "Ldha", "Ldhb", "Adh5", 
+    "Idh2"), Hypoxia = c("Ackr3", "Adm", "Adora2b", "Ak4", "Akap12", 
+    "Aldoa", "Aldob", "Aldoc", "Ampd3", "Angptl4", "Ankzf1", 
+    "Anxa2", "Atf3", "Atp7a", "B3galt6", "B4galnt2", "Bcan", 
+    "Bcl2", "Bgn", "Bhlhe40", "Bnip3l", "Brs3", "Btg1", "Car12", 
+    "Casp6", "Cav1", "Cavin1", "Cavin3", "Ccn1", "Ccn2", "Ccn5", 
+    "Ccng2", "Cdkn1a", "Cdkn1b", "Cdkn1c", "Cdkn1c", "Chst2", 
+    "Chst3", "Cited2", "Col5a1", "Cp", "Csrp2", "Cxcr4", "Dcn", 
+    "Ddit3", "Ddit4", "Dpysl4", "Dtna", "Dusp1", "Edn2", "Efna1", 
+    "Efna3", "Egfr", "Eno1", "Eno2", "Eno3", "Errfi1", "Ets1", 
+    "Ext1", "F3", "Fam162a", "Fbp1", "Fos", "Fosl2", "Foxo3", 
+    "Gaa", "Galk1", "Gapdh", "Gapdhs", "Gbe1", "Gck", "Gcnt2", 
+    "Gcnt2", "Glrx", "Gpc1", "Gpc3", "Gpc4", "Gpi1", "Grhpr", 
+    "Gys1", "Has1", "Hdlbp", "Hexa", "Hk1", "Hk2", "Hmox1", "Hoxb9", 
+    "Hs3st1", "Hspa5", "Ids", "Ier3", "Ier3", "Ier3", "Ier3", 
+    "Ier3", "Ier3", "Ier3", "Igfbp1", "Igfbp3", "Il6", "Ilvbl", 
+    "Inha", "Irs2", "Isg20", "Jmjd6", "Jun", "Kdelr3", "Kdm3a", 
+    "Kif5a", "Klf6", "Klf7", "Klhl24", "Lalba", "Large1", "Ldha", 
+    "Ldha", "Ldhc", "Lox", "Lxn", "Maff", "Map3k1", "Mif", "Mif", 
+    "Mxi1", "Myh9", "Nagk", "Ncan", "Ndrg1", "Ndst1", "Ndst2", 
+    "Nedd4l", "Nfil3", "Noct", "Nr3c1", "P4ha1", "P4ha2", "Pam", 
+    "Pck1", "Pdgfb", "Pdk1", "Pdk3", "Pfkfb3", "Pfkl", "Pfkp", 
+    "Pgam2", "Pgf", "Pgk1", "Pgm1", "Pgm2", "Phkg1", "Pim1", 
+    "Pklr", "Pklr", "Pkp1", "Plac8", "Plaur", "Plin2", "Pnrc1", 
+    "Ppargc1a", "Ppfia4", "Ppp1r15a", "Ppp1r3c", "Prdx5", "Prkca", 
+    "Pygm", "Rbpj", "Rora", "Rragd", "S100a4", "Sap30", "Scarb1", 
+    "Sdc2", "Sdc3", "Sdc4", "Selenbp1", "Serpine1", "Siah2", 
+    "Slc25a1", "Slc2a1", "Slc2a3", "Slc2a5", "Slc37a4", "Slc37a4", 
+    "Slc37a4", "Slc6a6", "Srpx", "Stbd1", "Stc1", "Stc2", "Sult2b1", 
+    "Tes", "Tgfb3", "Tgfbi", "Tgm2", "Tiparp", "Tktl1", "Tmem45a", 
+    "Tnfaip3", "Tpbg", "Tpbg", "Tpd52", "Tpi1", "Tpst2", "Ugp2", 
+    "Vegfa", "Vhl", "Vldlr", "Wsb1", "Xpnpep1", "Zfp36"), `ID2-hi myeloid prog` = c("Cd14", 
+    "Id2", "Vcan", "S100a9", "Clec12a", "Klf4", "Plaur"), `Lymph prog` = c("Vpreb1", 
+    "Mme", "Ebf1", "Ssbp2", "Bach2", "Cd79b", "Ighm", "Pax5", 
+    "Prkce", "Dntt", "Igll1"), M2_Macs = c("Ms4a6d", "Cd163", 
+    "Stab1", "Slc1a3", "Colec12", "F13a1", "Mrc1", "Tlr2", "Cd163l1", 
+    "Slco2b1"), Macs = c("Spic", "Fabp3", "Cd5l", "Ccl3", "C1qc", 
+    "C1qb", "Fabp4", "C1qa", "Apoe", "Selenop"), Mast = c("Kit", 
+    "Tpsab1", "Cpa3", "Clu"), `MK/E prog` = c("Itga2b", "Ryr3"
+    ), Naïve = c("Il7r", "Ccr7", "Sell", "Foxo1", "Klf2", "Klf3", 
+    "Lef1", "Tcf7", "Actn1", "Foxp1"), `Naïve CD20+ B` = c("Ms4a1", 
+    "Il4ra", "Ighd", "Fcrl1", "Ighm"), Neutrophils = c("Cxcl10", 
+    "Ifit1", "Rsad2", "Stat1"), NK = c("Nkg7", "Cd247", "Grik4", 
+    "Fcer1g", "Tyrobp", "Klrg1", "Fcgr3"), `Normal Epithelial` = c("Krt14", 
+    "Krt17", "Ltf", "Krt15", "Ptn", "Mgp", "Tacstd2", "Mmp7", 
+    "Scgb3a1", "Krt5", "Cryab", "Cxcl2", "Saa1", "Cldn4", "Wfdc2", 
+    "Mylk", "Tm4sf1", "Sfrp1", "Azgp1", "Dst", "Krt8", "Csrp1", 
+    "Actg2", "Krt7", "Tagln", "Clu", "Pdlim3", "Sfn", "Maff", 
+    "Slpi", "Ccl28", "Fbxo32", "Perp", "Krt18", "Cnn1", "Cxcl14", 
+    "Ccn1", "Rcan1", "Acta2", "Pip"), Normoblast = c("Slc4a1", 
+    "Slc25a37", "Hba-a2", "Hba-a1", "Tfrc"), `Oxidative phosphorylation` = c("Atp6v1h", 
+    "Atp2b4", "Atp6v1g3", "Atp1b1", "Atp1a4", "Atp1a2", "Atp5c1", 
+    "Atp5g3", "Atp8b4", "Atp9a", "Atp5e", "Atp11b", "Atp8b2", 
+    "Atp1a1", "Atp5f1", "Atp6v0d2", "Atp8b5", "Atp6v1g1", "Atpaf1", 
+    "Atp6v0b", "Atpif1", "Atp13a2", "Atp8a1", "Atp5k", "Atp2a2", 
+    "Atp6v0a2", "Atp5j2", "Atp6v1f", "Atp6v1fnb", "Atp6v0a4", 
+    "Atp6v0e2", "Atp6v1b1", "Atp2b2", "Atp6v1e1", "Atp1a3", "Atp4a", 
+    "Atp10a", "Atp2a1", "Atp11a", "Atp4b", "Atp7b", "Atp6v1b2", 
+    "Atp13a1", "Atp6v0d1", "Atp2c2", "Atp5l", "Atp1b3", "Atp2c1", 
+    "Atp5d", "Atp8b3", "Atp2b1", "Atp23", "Atp5b", "Atp10b", 
+    "Atpaf2", "Atp1b2", "Atp2a3", "Atp5g1", "Atp6v0a1", "Atp5h", 
+    "Atp6v1c2", "Atp6v1d", "Atp5mpl", "Atp6ap1l", "Atp12a", "Atp8a2", 
+    "Atpsckmt", "Atp6v1c1", "Atp5g2", "Atp13a5", "Atp13a4", "Atp13a3", 
+    "Atp6v1a", "Atp5j", "Atp5o", "Atp6v0c", "Atp6v0e", "Atp6v1g2", 
+    "Atp6v1e2", "Atp8b1", "Atp5a1", "Atp9b", "Atp5md", "Atp6ap2", 
+    "Atp1b4", "Atp11c", "Atp2b3", "Atp6ap1", "Atp7a", "Cox16", 
+    "Cox17", "Cox4i1", "Cox5a", "Cox5b", "Cox6a1", "Cox6b1", 
+    "Cox6c", "Cox7a2", "Cox7b", "Cox7c", "Cox8a", "Cyc1", "mt-Nd1", 
+    "mt-Nd2", "mt-Co1", "mt-Co2", "mt-Atp8", "mt-Atp6", "mt-Co3", 
+    "mt-Nd3", "mt-Nd4l", "mt-Nd4", "mt-Nd5", "mt-Nd6", "mt-Cytb", 
+    "Ndufa1", "Ndufa10", "Ndufa11", "Ndufa12", "Ndufa13", "Ndufa2", 
+    "Ndufa3", "Ndufa4", "Ndufa5", "Ndufa6", "Ndufab1", "Ndufaf3", 
+    "Ndufaf4", "Ndufaf8", "Ndufb10", "Ndufb11", "Ndufb2", "Ndufb3", 
+    "Ndufb4", "Ndufb6", "Ndufb7", "Ndufb8", "Ndufb9", "Ndufc1", 
+    "Ndufc2", "Ndufs2", "Ndufs3", "Ndufs5", "Ndufs6", "Ndufs7", 
+    "Ndufs8", "Ndufv1", "Ndufv2", "Sdha", "Sdhb", "Tcirg1", "Uqcrb", 
+    "Uqcrc1", "Uqcrc2", "Uqcrfs1", "Uqcrh", "Uqcrq", "Surf1", 
+    "Surf4"), pDCs = c("Siglech", "Ccr9", "Ly6d", "Jchain"), 
+    `Plasma cells` = c("Mzb1", "Hsp90b1", "Fndc3b", "Prdm1", 
+    "Igkc", "Jchain"), Plasmablast = c("Xbp1", "Prdm1"), Pro_Apoptosis = c("Bcl2l11", 
+    "Bid", "Bin1", "Bin2", "Bax", "Bak1", "Casp8", "Casp3"), 
+    PVL = c("Acta2", "Rgs5", "Tagln", "Myl9", "Ndufa4l2", "Tpm2", 
+    "Igfbp7", "Cald1", "Sod3", "Ccl19", "Col18a1", "Sparcl1", 
+    "Ccl2", "Myh11", "Lhfp", "Mfge8", "Ppp1r14a", "Rergl", "Igfbp5", 
+    "Notch3", "Ptp4a3", "Cpe", "Mcam", "Tinagl1", "Cav1", "Tpm1", 
+    "Bgn", "Frzb", "Gja4", "Pdgfrb", "Timp3", "Dstn", "Csrp2", 
+    "Map1b", "Mylk", "Cavin3", "Col4a2", "Cox4i2", "Sorbs2", 
+    "Sparc", "Higd1b", "Serping1", "Polr2k", "Adamts1", "Pln", 
+    "Gpx3", "Timp1", "Id3", "Col4a1", "Thy1", "Ifitm3", "Filip1l", 
+    "Pgf", "Cavin1", "A2m", "Crispld2", "Rgs16", "Map3k7cl", 
+    "Cryab", "C1qtnf1", "Nr2f2", "Csrp1", "Tppp3", "Isyna1", 
+    "Eps8", "Steap4", "Tgfb1i1", "Pcolce", "Lmod1", "Egr1", "Col6a2", 
+    "Tsc22d1", "Jag1", "Rasd1", "Flna", "Ntrk2", "Smoc2", "Mef2c", 
+    "Epas1", "Mgst3", "Wfdc1", "Ednra", "Oaz2", "Ptk2", "Angptl4", 
+    "Serpinf1", "Adamts4", "Myc", "Fhl1", "Dkk3", "Bcam", "Sdc2", 
+    "Cnn3", "Cdkn1a", "Synpo2", "Cav2"), `Response to Hypoxia` = c("Alas2", 
+    "Ang", "Arnt2", "Bnip3", "Cd24a", "Chrna4", "Chrna7", "Chrnb2", 
+    "Cldn3", "Crebbp", "Cxcr4", "Egln1", "Egln2", "Ep300", "Epas1", 
+    "Hif1a", "Hsp90b1", "Mt3", "Ciao3", "Nf1", "Pdia2", "Plod1", 
+    "Plod2", "Pml", "Smad3", "Smad4", "Tgfb2", "Vegfa"), `Stress Response` = c("Hikeshi", 
+    "P4hb", "Uba52", "Mapk1", "Rpa2", "Rpa3", "Tnrc6a", "Tnrc6b", 
+    "Tnrc6c", "Nup210", "Rbx1", "Ubb", "Ubc", "Crebbp", "Ets1", 
+    "Lamtor1", "Eed", "Lamtor2", "Hsp90aa1", "Rbbp4", "Lamtor4", 
+    "Lamtor5", "Psmb10", "Cdkn1a", "Anapc11", "Psma1", "Atg4d", 
+    "Psma2", "Wipi2", "Psma3", "Tfdp2", "Psma4", "Atm", "Cycs", 
+    "Psma5", "Wdr45", "Anapc16", "Psma6", "Ehmt1", "Psma7", "Ehmt2", 
+    "Terf1", "Psmc1", "Atr", "Psmc3", "Sod1", "Psmc4", "Psmc5", 
+    "Psmc6", "Psme1", "Atg3", "Ncf1", "Psme2", "Atg5", "Chmp2a", 
+    "Chmp2b", "Gsk3b", "Rps19bp1", "Tpr", "Mdm4", "Elob", "Cdc26", 
+    "Eloc", "St13", "Rps6ka1", "Eef1a1", "Rps6ka3", "Dnajb1", 
+    "Camk2g", "Rps27a", "Txn2", "Prdx1", "Prdx2", "Dnajb6", "Fkbp4", 
+    "Prdx3", "Map2k3", "Mtmr14", "Atg12", "Prdx5", "Rheb", "Prdx6", 
+    "Gstp1", "Atg14", "Rela", "Gpx1", "Vhl", "Hspa1a", "Ube2d1", 
+    "Terf2ip", "Hspa1b", "Ube2d2a", "Txn1", "Ube2d3", "Hsph1", 
+    "Cyba", "Cdk4", "Hsf1", "Cdk6", "Mapkapk3", "Cited2", "Map1lc3b", 
+    "Psmd12", "Hif1a", "Hmga1", "Psmd13", "Mink1", "Psmd14", 
+    "Hsp90ab1", "Ptges3", "Hsbp1", "Nfkb1", "Uvrag", "Cat", "Psmb1", 
+    "Cdkn2c", "Psmb2", "Cdkn2d", "Fos", "Psmb3", "Ccs", "Jun", 
+    "Gabarapl1", "Gabarapl2", "Psmb6", "Kdm6b", "Psmb8", "Psmd2", 
+    "Tnik", "Psmb9", "Psmd3", "Ranbp2", "Atox1", "Sem1", "Psmd6", 
+    "Gabarap", "Psmd7", "Psmf1", "Chmp3", "Stat3", "Psmd8", "Tinf2", 
+    "Psmd9", "Chmp7", "Ccar2", "Hspa4", "Ywhae", "Bag1", "Hspa5", 
+    "Bag3", "Dynll1", "Hspa8", "Rb1cc1", "Bag5", "Anapc5", "Dynll2", 
+    "Vcp", "Dnajc2", "Cabin1", "Cebpb"), `T activation` = c("Cd3e", 
+    "Cd69", "Cd38"), `T Naïve` = c("Lef1", "Ccr7", "Tcf7"), 
+    `Transitional B` = c("Mme", "Cd38", "Cd24a", "Acsm3", "Msi2"
+    ))
+SeuratObj <-  AddModuleScore(SeuratObj,
+                             features = marker.list,
+                             ctrl = 5,
+                             name = "FunctionScore")
+for(i in 1:length(marker.list[-44])){
+  colnames(SeuratObj@meta.data)[colnames(SeuratObj@meta.data) == paste0("FunctionScore", i)] <- names(marker.list)[i]
+}
+```
+
+Assign cell types based on marker expression
+
+``` r
+Assign= list(Tcells = c("C14", "C19", "C10", "C23", "C09", "C12"), NKcells = "C01", 
+    Tumor = c("C16", "C04", "C07", "C06", "C17", "C13"), BCells = "C22", 
+    Neutrophils = "C03", Monocytes = "C08", Macs = c("C15", "C05", 
+    "C30"), DCs = c("C18", "C11", "C24", "C20"), Mastcells = "C25", 
+    Vasc = "C21", Myeloid_Prog = "C29", CAFs = "C26", Blood = "C28", 
+    Plasmablast = "C27", Epithelial = "C02")
+
+
+SeuratObj$Assignment=NA
+for(i in 1:length(Assign)){
+  SeuratObj$Assignment[SeuratObj$Cluster %in% Assign[[i]]]=names(Assign[i])
+}
+```
+
+CNV prediction to confirm malignant vs normal cells
+
+``` r
+library(infercnv)
+counts_matrix = as.matrix(SeuratObj@assays$RNA@counts[,colnames(SeuratObj)]) 
+metadatasub=SeuratObj@meta.data[,"Assignment",drop=F]
+
+genes=read.delim("../gene_positions.txt",row.names = 1,header = F)
+colnames(genes)=c("C_CHR", "C_START", "C_STOP")
+features=read.delim(paste0("../filtered_feature_bc_matrix/features.tsv.gz"),row.names = 1,header = F)
+featuressub=features[features$V2 %in%row.names(SeuratObj),]
+genessub=genes[match(row.names(featuressub),row.names(genes)),]
+featuressub$V2=make.unique(featuressub$V2)
+row.names(genessub)=featuressub$V2
+genessub=genessub[row.names(SeuratObj),];dim(genessub)
+
+dir="infCNV/"
+dir.create(dir)
+options(scipen = 100)
+library(infercnv)
+infercnv_obj = CreateInfercnvObject(raw_counts_matrix=counts_matrix,
+                                    annotations_file=metadatasub,
+                                    delim="\t",
+                                    gene_order_file=genessub,
+                                    ref_group_names=c("Tcells","NKcells","Monocytes","Macs")) 
+options(Seurat.object.assay.version = "v3")
+
+infercnv_obj = infercnv::run(infercnv_obj,scale_data = T,
+                             cutoff=0.1, # cutoff=1 works well for Smart-seq2, and cutoff=0.1 works well for 10x Genomics
+                             out_dir=dir, num_threads = 1,
+                             cluster_by_groups=TRUE, 
+                             denoise=TRUE,
+                             HMM=TRUE)
+SeuratObj=add_to_seurat(
+  seurat_obj = SeuratObj,
+  assay_name = "RNA",
+  dir,
+  top_n = 10,
+  bp_tolerance = 2e+06,
+  column_prefix = NULL
+)
+```
+
+De Novo clustering of T cells
+
+``` r
+SeuratObjT=subset(SeuratObj,subset= Assignment %in% c("Tcells","NKcells"))
+ObjName= "E0771 T&NKcells "
+Subset="TCells"
+resolution= 1
+dimz=1:15
+abb="TNC"
+```
+
+T cells dimension reduction and clustering
+
+``` r
+SeuratObjT <- NormalizeData(SeuratObjT, normalization.method = "LogNormalize", scale.factor = 10000)%>%
+  FindVariableFeatures( selection.method = "vst", nfeatures = 2000)%>%
+  ScaleData(features = rownames(SeuratObjT))%>%
+  RunPCA(features = VariableFeatures(object = SeuratObjT))
+
+SeuratObjT <- RunHarmony(SeuratObjT, "Sample")
+#ElbowPlot(SeuratObjT,ndims = 50,reduction = "harmony")
+
+dimz=1:50
+resolution=0.2
+SeuratObjT <- FindNeighbors(SeuratObjT,reduction = "harmony", dims = dimz)%>% 
+  RunUMAP( reduction = "harmony",dims= dimz)%>%
+  FindClusters(resolution = resolution)
+
+
+#Rename Clusters
+SeuratObjT$Cluster=NA
+
+clusters=levels(as.factor(SeuratObjT@meta.data$seurat_clusters))
+for(j in 1:length(clusters)){
+  if(j<10){
+    SeuratObjT$Cluster[SeuratObjT$seurat_clusters==j-1]=paste0("TNC0",j)
+  }else{
+    SeuratObjT$Cluster[SeuratObjT$seurat_clusters==j-1]=paste0("TNC",j)
+  }
+}
+
+markers = FindAllMarkers(SeuratObjT,logfc.threshold = 0.5,test.use = "wilcox",only.pos = T )
+write.csv(markers,paste0(OutputDirectory,ObjName," - ",Subset," - Cluster Markers - ","res ",resolution,".csv"))
+```
+
+Assigning T cells subsets based on marker expression and ProjecTILs
+projection
+
+``` r
+library(ProjecTILs)
+
+ref <- readRDS(paste0("../ref_TILAtlas_mouse_v1.rds"))
+query.projected <- make.projection(SeuratObjT, ref=ref, filter.cells = T)
+query.projected <- cellstate.predict(ref=ref, query=query.projected)
+SeuratObjT$ProjecTILsAssignment = query.projected$functional.cluster
+table(SeuratObjT$ProjecTILsAssignment,SeuratObjT$Cluster)
+
+Tgenes=c("Cd3g","Cd8a","Cd4","Tbx21","Ifng","Gata3","Il4","Foxp3","Il2ra","Il10","Gzmb","Prf1","Klrk1",
+  "Cd69","Mki67","Il2","Il12a","Cd28","Tnfrsf9","Tnfrsf4","Pdcd1","Tigit","Lag3",
+  "Il7r","Cd44","Sell")
+DotPlot(SeuratObjT,group.by = "Assignment",dot.scale = 5 ,features = Tgenes ,scale = T)+scale_colour_viridis_c(option = "plasma")+
+  ggmin::theme_min()+ RotatedAxis()+theme(axis.title = element_blank())+labs(title=paste("Clusters"))
+
+
+Assign=list(`Naiive TCells-CD8+` = "TNC09", `Exhasted CD8+ TCells` = "TNC06", 
+    `CD4+ TCells` = "TNC10", `Activated TCells` = "TNC04", `Effector CD4+ TCells` = "TNC07", 
+    Treg = "TNC02", `Proliferating TCells` = "TNC08", doublet = "TNC11", 
+    `Effector Memory` = "TNC14", `CD8+ TCells` = "TNC13", NKcells = c("TNC01", 
+    "TNC03", "TNC05", "TNC12"))
+SeuratObjT$Assignment=NA
+for(i in 1:length(Assign)){
+  SeuratObjT$Assignment[SeuratObjT$Cluster %in% Assign[[i]]]=names(Assign[i])
+}
+```
